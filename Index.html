@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>🍉 Fruit Ninja</title>
+<!-- SDK Яндекса (раскомментируй, когда загрузишь в черновик Яндекс Игр) -->
+<!-- <script src="https://yandex.ru/games/sdk/v2"></script> -->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #12121a;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // ==========================================================
+  // 1. АДАПТИВ И РАЗМЕРЫ
+  // ==========================================================
+  let W, H, DPR;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ==========================================================
+  // 2. ЯНДЕКС SDK
+  // ==========================================================
+  let ysdk = null;
+  function initYandexSDK() {
+    if (typeof YaGames === 'undefined') return;
+    YaGames.init().then(sdk => {
+      ysdk = sdk;
+      console.log('Yandex SDK initialized');
+      if (ysdk.features && ysdk.features.LoadingAPI) {
+        ysdk.features.LoadingAPI.ready();
+      }
+    }).catch(err => console.warn('Yandex SDK error:', err));
+  }
+  initYandexSDK();
+
+  // ==========================================================
+  // 3. НАСТРОЙКИ
+  // ==========================================================
+  const DIFFICULTIES = {
+    easy:   { name: 'ИЗИ',     speed: 1.0, spawn: 900, bombChance: 0.08, lives: 5, mult: 1, color: '#4ade80' },
+    hard:   { name: 'КРУТЯК',  speed: 1.3, spawn: 650, bombChance: 0.20, lives: 3, mult: 2, color: '#fbbf24' },
+    insane: { name: 'ТОТЯ ❤️', speed: 1.6, spawn: 480, bombChance: 0.35, lives: 2, mult: 4, color: '#f87171' },
+  };
+
+  const FRUITS = [
+    { emoji: '🍉', color: '#ff4444' },
+    { emoji: '🍎', color: '#cc0000' },
+    { emoji: '🍊', color: '#ff9500' },
+    { emoji: '🍋', color: '#ffe000' },
+    { emoji: '🍇', color: '#9b59b6' },
+    { emoji: '🍓', color: '#e91e63' },
+    { emoji: '🥝', color: '#5cb85c' },
+    { emoji: '🍑', color: '#ff8fa3' },
+    { emoji: '🍍', color: '#f0c020' },
+  ];
+
+  // ==========================================================
+  // 4. СОСТОЯНИЕ
+  // ==========================================================
+  let state = 'menu';
+  let prevState = 'menu';
+  let difficulty = null;
+  let currentDiffKey = 'easy';
+  let fruits = [];
+  let halves = [];
+  let particles = [];
+  let trail = [];
+  let score = 0;
+  let bestScore = +(localStorage.getItem('fn_best') || 0);
+  let lives = 0;
+  let spawnTimer = 0;
+  let combo = 0;
+  let comboTimer = 0;
+  let gameOverReason = '';
+  let isPointerDown = false;
+  let lastTime = 0;
+  let shake = 0;
+
+  let menuOptions = [];
+  let gameoverButtons = [];
+
+  // ==========================================================
+  // 5. КЛАССЫ
+  // ==========================================================
+  class Fruit {
+    constructor(diff) {
+      this.radius = Math.max(28, Math.min(W, H) * 0.045);
+      // Спавним в пределах экрана, с учётом радиуса
+      this.x = this.radius + Math.random() * (W - this.radius * 2);
+      this.y = H + 60;
+      this.vx = (Math.random() - 0.5) * 4.5 * diff.speed;
+      this.vy = -(16 + Math.random() * 4) * diff.speed * (H / 700);
+      this.rot = (Math.random() - 0.5) * 0.6;
+      this.rotSpeed = (Math.random() - 0.5) * 0.05;
+      this.sliced = false;
+      this.sliceTime = 0;
+      this.isBomb = Math.random() < diff.bombChance;
+      if (this.isBomb) {
+        this.emoji = '💣';
+        this.color = '#000';
+        this.radius *= 1.05;
+      } else {
+        const f = FRUITS[(Math.random() * FRUITS.length) | 0];
+        this.emoji = f.emoji;
+        this.color = f.color;
+      }
+    }
+    update(dt) {
+      const s = dt / 16.67;
+      this.x += this.vx * s;
+      this.y += this.vy * s;
+      this.vy += 0.55 * s;
+      this.rot += this.rotSpeed * s;
+
+      // === ОТСКОК ОТ БОКОВЫХ СТЕНОК ===
+      if (this.x - this.radius < 0) {
+        this.x = this.radius;
+        this.vx = Math.abs(this.vx) * 0.8;
+      } else if (this.x + this.radius > W) {
+        this.x = W - this.radius;
+        this.vx = -Math.abs(this.vx) * 0.8;
+      }
+
+      if (this.sliced) this.sliceTime += s;
+    }
+    offScreen() { return this.y > H + 100; }
+    hit(px, py) {
+      return Math.hypot(this.x - px, this.y - py) < this.radius * 1.2;
+    }
+    draw() {
+      if (this.sliced) return;
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.rot);
+      ctx.font = `${this.radius * 2}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,0.5)';
+      ctx.shadowBlur = 10;
+      ctx.fillText(this.emoji, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  class FruitHalf {
+    constructor(x, y, vx, vy, emoji, side, angle, radius) {
+      this.x = x; this.y = y;
+      this.vx = vx;
+      this.vy = vy;
+      this.emoji = emoji;
+      this.side = side;
+      this.rot = angle;
+      this.rotSpeed = side * (0.15 + Math.random() * 0.1);
+      this.size = radius;
+      this.life = 120;
+      this.gravity = 0.55;
+    }
+    update(dt) {
+      const s = dt / 16.67;
+      this.x += this.vx * s;
+      this.y += this.vy * s;
+      this.vy += this.gravity * s;
+      this.rot += this.rotSpeed * s;
+      this.life -= s;
+
+      // Половинки тоже отскакивают, чтобы красиво не улетали
+      if (this.x - this.size < 0) {
+        this.x = this.size;
+        this.vx = Math.abs(this.vx) * 0.7;
+      } else if (this.x + this.size > W) {
+        this.x = W - this.size;
+        this.vx = -Math.abs(this.vx) * 0.7;
+      }
+    }
+    draw() {
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, this.life / 40);
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.rot);
+
+      ctx.beginPath();
+      if (this.side < 0) {
+        ctx.rect(-this.size * 2, -this.size * 2, this.size * 2, this.size * 4);
+      } else {
+        ctx.rect(0, -this.size * 2, this.size * 2, this.size * 4);
+      }
+      ctx.clip();
+
+      ctx.font = `${this.size * 2}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,0.5)';
+      ctx.shadowBlur = 8;
+      ctx.fillText(this.emoji, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  class Particle {
+    constructor(x, y, color) {
+      this.x = x; this.y = y;
+      this.vx = (Math.random() - 0.5) * 14;
+      this.vy = (Math.random() - 0.5) * 14 - 3;
+      this.life = 30 + Math.random() * 20;
+      this.maxLife = this.life;
+      this.color = color;
+      this.size = 2 + Math.random() * 4;
+    }
+    update(dt) {
+      const s = dt / 16.67;
+      this.x += this.vx * s;
+      this.y += this.vy * s;
+      this.vy += 0.45 * s;
+      this.life -= s;
+    }
+    draw() {
+      const a = Math.max(0, this.life / this.maxLife);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  class JuiceSplat {
+    constructor(x, y, color) {
+      this.x = x; this.y = y;
+      this.color = color;
+      this.life = 60;
+      this.maxLife = 60;
+      this.r = 5 + Math.random() * 18;
+    }
+    update(dt) { this.life -= dt / 16.67; }
+    draw() {
+      const a = Math.max(0, this.life / this.maxLife) * 0.6;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ==========================================================
+  // 6. ЛОГИКА
+  // ==========================================================
+  function startGame(key) {
+    currentDiffKey = key;
+    difficulty = DIFFICULTIES[key];
+    state = 'playing';
+    fruits = [];
+    halves = [];
+    particles = [];
+    trail = [];
+    score = 0;
+    lives = difficulty.lives;
+    spawnTimer = 0;
+    combo = 0;
+    comboTimer = 0;
+    gameOverReason = '';
+    shake = 0;
+  }
+
+  function spawnFruit() {
+    fruits.push(new Fruit(difficulty));
+    if (Math.random() < 0.35) fruits.push(new Fruit(difficulty));
+  }
+
+  function sliceAt(px, py) {
+    if (state !== 'playing') return;
+    let slicedNow = 0;
+    for (const f of fruits) {
+      if (!f.sliced && f.hit(px, py)) {
+        f.sliced = true;
+        f.sliceTime = 0;
+
+        if (f.isBomb) {
+          shake = 30;
+          for (let i = 0; i < 50; i++) {
+            particles.push(new Particle(f.x, f.y, i % 2 ? '#ff6600' : '#ffcc00'));
+          }
+          gameOverReason = '💣 БУМ! Ты взорвался!';
+          endGame();
+          return;
+        } else {
+          slicedNow++;
+          score += 10 * difficulty.mult;
+
+          const angle = Math.atan2(f.vy, f.vx);
+          const perpX = -Math.sin(angle);
+          const perpY = Math.cos(angle);
+          const spread = 5;
+
+          halves.push(new FruitHalf(
+            f.x, f.y,
+            f.vx + perpX * spread, f.vy + perpY * spread,
+            f.emoji, -1, f.rot, f.radius
+          ));
+          halves.push(new FruitHalf(
+            f.x, f.y,
+            f.vx - perpX * spread, f.vy - perpY * spread,
+            f.emoji, +1, f.rot, f.radius
+          ));
+
+          for (let i = 0; i < 20; i++) {
+            particles.push(new Particle(f.x, f.y, f.color));
+          }
+          particles.push(new JuiceSplat(f.x, f.y, f.color));
+        }
+      }
+    }
+    if (slicedNow > 0) {
+      combo += slicedNow;
+      comboTimer = 60;
+      if (combo >= 3) {
+        score += combo * 5 * difficulty.mult;
+      }
+    }
+  }
+
+  function endGame() {
+    state = 'gameover';
+    if (score > bestScore) {
+      bestScore = score;
+      try { localStorage.setItem('fn_best', bestScore); } catch(e) {}
+    }
+  }
+
+  function pauseGame() {
+    if (state === 'playing') {
+      prevState = state;
+      state = 'paused';
+    }
+  }
+
+  function resumeGame() {
+    if (state === 'paused') {
+      state = prevState;
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseGame();
+  });
+  window.addEventListener('blur', pauseGame);
+  window.addEventListener('focus', () => {
+    setTimeout(resumeGame, 100);
+  });
+
+  // ==========================================================
+  // 7. UPDATE
+  // ==========================================================
+  function update(dt) {
+    if (shake > 0) shake = Math.max(0, shake - dt / 20);
+
+    if (state === 'playing') {
+      spawnTimer += dt;
+      if (spawnTimer >= difficulty.spawn) {
+        spawnTimer = 0;
+        spawnFruit();
+      }
+
+      for (let i = fruits.length - 1; i >= 0; i--) {
+        const f = fruits[i];
+        f.update(dt);
+        if (f.sliced) {
+          fruits.splice(i, 1);
+        } else if (f.offScreen()) {
+          if (!f.isBomb) {
+            lives--;
+            if (lives <= 0) {
+              gameOverReason = 'Фрукты упали!';
+              endGame();
+            }
+          }
+          fruits.splice(i, 1);
+        }
+      }
+
+      if (comboTimer > 0) {
+        comboTimer -= dt / 16.67;
+        if (comboTimer <= 0) combo = 0;
+      }
+    }
+
+    for (let i = halves.length - 1; i >= 0; i--) {
+      halves[i].update(dt);
+      if (halves[i].life <= 0 || halves[i].y > H + 200) halves.splice(i, 1);
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      particles[i].update(dt);
+      if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+
+    for (let i = trail.length - 1; i >= 0; i--) {
+      trail[i].life -= dt / 16.67;
+      if (trail[i].life <= 0) trail.splice(i, 1);
+    }
+    if (trail.length > 20) trail.splice(0, trail.length - 20);
+  }
+
+  // ==========================================================
+  // 8. РИСОВАНИЕ
+  // ==========================================================
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#1a1a2e');
+    g.addColorStop(1, '#0f0f1a');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawTrail() {
+    if (trail.length < 2) return;
+    for (let i = 0; i < trail.length; i++) {
+      const p = trail[i];
+      const t = p.life / 20;
+      const r = Math.max(1, t * 14);
+      const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+      grad.addColorStop(0, `rgba(180, 230, 255, ${t * 0.9})`);
+      grad.addColorStop(1, `rgba(100, 180, 255, 0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawMenu() {
+    drawBackground();
+    ctx.textAlign = 'center';
+
+    ctx.font = `bold ${Math.min(W * 0.08, 64)}px Arial`;
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = '#e33';
+    ctx.shadowBlur = 25;
+    ctx.fillText('🍉 FRUIT NINJA 🍉', W / 2, H * 0.16);
+    ctx.shadowBlur = 0;
+
+    ctx.font = `${Math.min(W * 0.035, 26)}px Arial`;
+    ctx.fillStyle = '#ccc';
+    ctx.fillText('Выбери сложность:', W / 2, H * 0.28);
+
+    const options = [
+      { key: 'easy',   num: '1', title: 'ИЗИ',     desc: '5 жизней · мало бомб',    color: '#4ade80' },
+      { key: 'hard',   num: '2', title: 'КРУТЯК',  desc: '3 жизни · 20% бомб · x2', color: '#fbbf24' },
+      { key: 'insane', num: '3', title: 'ТОТЯ ❤️', desc: '2 жизни · 35% бомб · x4', color: '#f87171' },
+    ];
+
+    const bw = Math.min(W * 0.8, 520);
+    const bh = Math.min(H * 0.14, 90);
+    const gap = 16;
+    const startY = H * 0.35;
+
+    options.forEach((opt, i) => {
+      const y = startY + i * (bh + gap);
+      const x = (W - bw) / 2;
+
+      const grad = ctx.createLinearGradient(x, y, x + bw, y + bh);
+      grad.addColorStop(0, opt.color + '33');
+      grad.addColorStop(1, opt.color + '11');
+      ctx.fillStyle = grad;
+      roundRect(x, y, bw, bh, 16);
+      ctx.fill();
+
+      ctx.strokeStyle = opt.color;
+      ctx.lineWidth = 3;
+      roundRect(x, y, bw, bh, 16);
+      ctx.stroke();
+
+      ctx.fillStyle = opt.color;
+      ctx.font = `bold ${bh * 0.45}px Arial`;
+      ctx.textAlign = 'left';
+      ctx.fillText(opt.num, x + 24, y + bh * 0.62);
+
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${bh * 0.32}px Arial`;
+      ctx.fillText(opt.title, x + 70, y + bh * 0.45);
+
+      ctx.fillStyle = '#ddd';
+      ctx.font = `${bh * 0.19}px Arial`;
+      ctx.fillText(opt.desc, x + 70, y + bh * 0.78);
+
+      opt.rect = { x, y, w: bw, h: bh };
+    });
+
+    if (bestScore > 0) {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = `${Math.min(W * 0.03, 20)}px Arial`;
+      ctx.fillText(`🏆 Рекорд: ${bestScore}`, W / 2, H - 50);
+    }
+
+    ctx.fillStyle = '#666';
+    ctx.font = `${Math.min(W * 0.025, 15)}px Arial`;
+    ctx.fillText('Нажми 1 / 2 / 3 или кликни по кнопке', W / 2, H - 20);
+
+    menuOptions = options;
+  }
+
+  function drawHUD() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.font = `bold ${Math.min(W * 0.045, 30)}px Arial`;
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur = 6;
+    ctx.fillText(`Очки: ${score}`, 20, 20);
+
+    ctx.font = `${Math.min(W * 0.028, 18)}px Arial`;
+    ctx.fillStyle = difficulty.color;
+    ctx.fillText(`Сложность: ${difficulty.name}`, 20, 62);
+    ctx.shadowBlur = 0;
+
+    ctx.textAlign = 'right';
+    ctx.font = `${Math.min(W * 0.04, 26)}px Arial`;
+    ctx.fillStyle = '#f87171';
+    let hearts = '';
+    for (let i = 0; i < lives; i++) hearts += '❤️';
+    ctx.fillText(hearts, W - 20, 20);
+
+    if (combo >= 3) {
+      ctx.textAlign = 'center';
+      ctx.font = `bold ${Math.min(W * 0.05, 34)}px Arial`;
+      ctx.fillStyle = '#fbbf24';
+      ctx.shadowColor = '#fbbf24';
+      ctx.shadowBlur = 15;
+      const scale = 1 + Math.sin(performance.now() / 100) * 0.05;
+      ctx.save();
+      ctx.translate(W / 2, 90);
+      ctx.scale(scale, scale);
+      ctx.fillText(`КОМБО x${combo}!`, 0, 0);
+      ctx.restore();
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.font = `bold ${Math.min(W * 0.1, 72)}px Arial`;
+    ctx.fillStyle = '#f87171';
+    ctx.shadowColor = '#f87171';
+    ctx.shadowBlur = 30;
+    ctx.fillText('GAME OVER', W / 2, H * 0.22);
+    ctx.shadowBlur = 0;
+
+    ctx.font = `${Math.min(W * 0.035, 26)}px Arial`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(gameOverReason, W / 2, H * 0.34);
+
+    ctx.font = `bold ${Math.min(W * 0.08, 56)}px Arial`;
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText(`${score}`, W / 2, H * 0.46);
+
+    ctx.font = `${Math.min(W * 0.025, 18)}px Arial`;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('очков', W / 2, H * 0.52);
+
+    if (score >= bestScore && score > 0) {
+      ctx.font = `bold ${Math.min(W * 0.03, 22)}px Arial`;
+      ctx.fillStyle = '#4ade80';
+      ctx.fillText('🏆 НОВЫЙ РЕКОРД!', W / 2, H * 0.58);
+    }
+
+    const btnW = Math.min(W * 0.35, 180);
+    const btnH = 60;
+    const gap = 20;
+    const startX = W / 2 - btnW - gap / 2;
+    const btnY = H * 0.72;
+
+    gameoverButtons = [
+      { text: 'ЗАНОВО', action: 'restart', x: startX, y: btnY, w: btnW, h: btnH, color: '#4ade80' },
+      { text: 'В МЕНЮ', action: 'menu', x: startX + btnW + gap, y: btnY, w: btnW, h: btnH, color: '#60a5fa' }
+    ];
+
+    gameoverButtons.forEach(btn => {
+      ctx.fillStyle = btn.color + '22';
+      roundRect(btn.x, btn.y, btn.w, btn.h, 12);
+      ctx.fill();
+
+      ctx.strokeStyle = btn.color;
+      ctx.lineWidth = 2;
+      roundRect(btn.x, btn.y, btn.w, btn.h, 12);
+      ctx.stroke();
+
+      ctx.fillStyle = btn.color;
+      ctx.font = `bold ${Math.min(W * 0.04, 22)}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(btn.text, btn.x + btn.w / 2, btn.y + btn.h / 2);
+    });
+  }
+
+  function drawPaused() {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(W * 0.08, 56)}px Arial`;
+    ctx.fillText('⏸ ПАУЗА', W / 2, H / 2);
+    ctx.font = `${Math.min(W * 0.03, 20)}px Arial`;
+    ctx.fillStyle = '#ccc';
+    ctx.fillText('Нажми на экран, чтобы продолжить', W / 2, H / 2 + 60);
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    if (state === 'menu') {
+      drawMenu();
+    } else {
+      drawBackground();
+
+      for (const p of particles) {
+        if (p instanceof JuiceSplat) p.draw();
+      }
+
+      for (const f of fruits) f.draw();
+      for (const h of halves) h.draw();
+
+      drawTrail();
+
+      for (const p of particles) {
+        if (!(p instanceof JuiceSplat)) p.draw();
+      }
+
+      if (state === 'playing' || state === 'paused') drawHUD();
+      if (state === 'gameover') drawGameOver();
+      if (state === 'paused') drawPaused();
+    }
+
+    ctx.restore();
+  }
+
+  // ==========================================================
+  // 9. ГЛАВНЫЙ ЦИКЛ
+  // ==========================================================
+  function loop(t) {
+    const dt = Math.min(50, t - lastTime || 16);
+    lastTime = t;
+    if (state !== 'paused') update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ==========================================================
+  // 10. ВВОД
+  // ==========================================================
+  function pointerPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    const src = e.touches ? e.touches[0] : e;
+    return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+  }
+
+  function handleDown(e) {
+    if (state === 'paused') {
+      resumeGame();
+      return;
+    }
+    isPointerDown = true;
+    const p = pointerPos(e);
+
+    if (state === 'menu') {
+      for (const opt of menuOptions) {
+        if (opt.rect && p.x >= opt.rect.x && p.x <= opt.rect.x + opt.rect.w &&
+            p.y >= opt.rect.y && p.y <= opt.rect.y + opt.rect.h) {
+          startGame(opt.key);
+          return;
+        }
+      }
+    } else if (state === 'playing') {
+      sliceAt(p.x, p.y);
+    } else if (state === 'gameover') {
+      for (const btn of gameoverButtons) {
+        if (p.x >= btn.x && p.x <= btn.x + btn.w &&
+            p.y >= btn.y && p.y <= btn.y + btn.h) {
+          if (btn.action === 'restart') startGame(currentDiffKey);
+          else if (btn.action === 'menu') state = 'menu';
+          return;
+        }
+      }
+    }
+  }
+
+  function handleMove(e) {
+    const p = pointerPos(e);
+    if (state === 'playing' && isPointerDown) {
+      sliceAt(p.x, p.y);
+      trail.push({ x: p.x, y: p.y, life: 20 });
+    }
+  }
+
+  function handleUp() {
+    isPointerDown = false;
+  }
+
+  canvas.addEventListener('mousedown', handleDown);
+  canvas.addEventListener('mousemove', handleMove);
+  window.addEventListener('mouseup', handleUp);
+
+  canvas.addEventListener('touchstart', (e) => { e.preventDefault(); handleDown(e); }, { passive: false });
+  canvas.addEventListener('touchmove', (e) => { e.preventDefault(); handleMove(e); }, { passive: false });
+  canvas.addEventListener('touchend', (e) => { e.preventDefault(); handleUp(); }, { passive: false });
+
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (state === 'menu') {
+      if (k === '1') startGame('easy');
+      else if (k === '2') startGame('hard');
+      else if (k === '3') startGame('insane');
+    } else if (state === 'gameover') {
+      if (k === 'r') startGame(currentDiffKey);
+      else if (k === 'm') state = 'menu';
+    } else if (state === 'playing' && k === 'escape') {
+      pauseGame();
+    }
+  });
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
